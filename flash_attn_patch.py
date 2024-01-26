@@ -1,155 +1,120 @@
-import pathlib
+from typing import List, Optional, Tuple
 import logging
-import transformers
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
 
 import torch
-torch.multiprocessing.set_sharing_strategy("file_system")
-from transformers import Trainer, TrainingArguments
-from transformers.trainer_utils import is_main_process, set_seed
-from transformers.data.data_collator import default_data_collator
+from torch import nn
 
-from .flash_attn_patch import replace_llama_attn_with_flash_attn
-from .modeling import AutoPromptSuggestor
+import transformers
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+from einops import rearrange
 
-from .dataset import PromptRewriteDataset
-from .multi_task_dataset import MultiTaskPromptRewriteDataset
-from .template import (
-    TRAIN_INPUT_TEMPLATE, TRAIN_OUTPUT_TEMPLATE, 
-    EVAL_INPUT_TEMPLATE, EVAL_OUTPUT_TEMPLATE
-)
-logger = logging.getLogger(__name__)
+from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+from flash_attn.bert_padding import unpad_input, pad_input
 
 
-@dataclass
-class ModelArguments:
-    model_name_or_path: str = field()
-    model_max_length: int = field(default=500)
-    
+def forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """Input shape: Batch x Time x Channel
 
-@dataclass
-class DataArguments:
-    train_data_path: str = field(
-        metadata={"help": "Path to the training data."}
+    attention_mask: [bsz, q_len]
+    """
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = (
+        self.q_proj(hidden_states)
+        .view(bsz, q_len, self.num_heads, self.head_dim)
+        .transpose(1, 2)
     )
-    valid_data_path: str = field(
-        metadata={"help": "Path to the training data."}
+    key_states = (
+        self.k_proj(hidden_states)
+        .view(bsz, q_len, self.num_heads, self.head_dim)
+        .transpose(1, 2)
     )
-    task_mode: str = field(metadata={"choices": ["single", "multi"]})
-
-
-@dataclass
-class MyTrainingArguments(TrainingArguments):
-    pass
-        
-        
-@dataclass
-class TrainCollator:
-    def __call__(self, features: List[str]) -> Dict[str, Any]:   
-        if isinstance(features[0], list):
-            features = sum(features, [])
-        features = default_data_collator(features)
-        max_len = features['attention_mask'].sum(-1).max().item()
-        features['input_ids'] = features['input_ids'][:, :max_len]
-        features['attention_mask'] = features['attention_mask'][:, :max_len]
-        features['labels'] = features['labels'][:, :max_len]
-        return features
-
-
-def train():
-
-    parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, MyTrainingArguments)
+    value_states = (
+        self.v_proj(hidden_states)
+        .view(bsz, q_len, self.num_heads, self.head_dim)
+        .transpose(1, 2)
     )
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    data_args: DataArguments
-    model_args: ModelArguments
-    training_args: MyTrainingArguments
+    # [bsz, q_len, nh, hd]
+    # [bsz, nh, q_len, hd]
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s-%(levelname)s-%(name)s- %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if is_main_process(training_args.local_rank) else logging.WARN,
-    )
+    kv_seq_len = key_states.shape[-2]
+    assert past_key_value is None, "past_key_value is not supported"
 
-    # Log on each process the small summary:
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(
+        query_states, key_states, cos, sin, position_ids
     )
-    # Set the verbosity to info of the Transformers logger (on main process only):
-    if is_main_process(training_args.local_rank):
-        transformers.utils.logging.set_verbosity_info()
-        transformers.utils.logging.enable_default_handler()
-        transformers.utils.logging.enable_explicit_format()
-    logger.info("Model parameters %s", model_args)
-    logger.info("Data parameters %s", data_args)
-    logger.info("Training parameters %s", training_args)
-    
-    # Set seed before initializing model.
-    set_seed(training_args.seed)
-    if "llama2" in model_args.model_name_or_path.lower():
-        from .flash_attn_patch import replace_llama_attn_with_flash_attn
-        replace_llama_attn_with_flash_attn()
-        logger.info("Replace llama attention with flash attention")
-        
-    model = AutoPromptSuggestor.from_pretrained(model_args.model_name_or_path)
+    # [bsz, nh, t, hd]
+    assert not output_attentions, "output_attentions is not supported"
+    assert not use_cache, "use_cache is not supported"
 
-    # Print how many parameters still requires grad
-    logger.info(f"Number of parameters still requires grad: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        model_max_length=model_args.model_max_length,
-        padding_side="right",
-        use_fast=False,
-    )
-    tokenizer.pad_token = tokenizer.unk_token
-    
-    if data_args.task_mode == "multi":
-        train_dataset = MultiTaskPromptRewriteDataset(
-            data_path=data_args.train_data_path,
-            tokenizer=tokenizer,
-            is_train = True,
-        ) 
-    elif data_args.task_mode == "single":
-        train_dataset = PromptRewriteDataset(
-            data_path=data_args.train_data_path,
-            tokenizer=tokenizer,
-            is_train = True,
-            input_template=TRAIN_INPUT_TEMPLATE,
-            output_template=TRAIN_OUTPUT_TEMPLATE,
-        ) 
+    # Flash attention codes from
+    # https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/flash_attention.py
+
+    # transform the data into the format required by flash attention
+    qkv = torch.stack(
+        [query_states, key_states, value_states], dim=2
+    )  # [bsz, nh, 3, q_len, hd]
+    qkv = qkv.transpose(1, 3)  # [bsz, q_len, 3, nh, hd]
+    # We have disabled _prepare_decoder_attention_mask in LlamaModel
+    # the attention_mask should be the same as the key_padding_mask
+    key_padding_mask = attention_mask
+
+    if key_padding_mask is None:
+        qkv = rearrange(qkv, "b s ... -> (b s) ...")
+        max_s = q_len
+        cu_q_lens = torch.arange(
+            0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=qkv.device
+        )
+        output = flash_attn_unpadded_qkvpacked_func(
+            qkv, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True
+        )
+        output = rearrange(output, "(b s) ... -> b s ...", b=bsz)
     else:
-        raise NotImplementedError(f"train_mode {data_args.train_mode} not implemented")
-    valid_dataset = PromptRewriteDataset(
-        data_path=data_args.valid_data_path,
-        tokenizer=tokenizer,
-        is_train = True,
-        input_template=EVAL_INPUT_TEMPLATE,
-        output_template=EVAL_OUTPUT_TEMPLATE,
-    ) 
-    
-    train_dataset.show_example()
+        nheads = qkv.shape[-2]
+        x = rearrange(qkv, "b s three h d -> b s (three h d)")
+        x_unpad, indices, cu_q_lens, max_s = unpad_input(x, key_padding_mask)
+        x_unpad = rearrange(
+            x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads
+        )
+        output_unpad = flash_attn_unpadded_qkvpacked_func(
+            x_unpad, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True
+        )
+        output = rearrange(
+            pad_input(
+                rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, bsz, q_len
+            ),
+            "b s (h d) -> b s h d",
+            h=nheads,
+        )
+    return self.o_proj(rearrange(output, "b s h d -> b s (h d)")), None, None
 
-    trainer = Trainer(
-        model=model, 
-        tokenizer=tokenizer, 
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=valid_dataset,
-        data_collator=TrainCollator(),
+
+# Disable the transformation of the attention mask in LlamaModel as the flash attention
+# requires the attention mask to be the same as the key_padding_mask
+def _prepare_decoder_attention_mask(
+    self, attention_mask, input_shape, inputs_embeds, past_key_values_length
+):
+    # [bsz, seq_len]
+    return attention_mask
+
+
+def replace_llama_attn_with_flash_attn():
+    cuda_major, cuda_minor = torch.cuda.get_device_capability()
+    if cuda_major < 8:
+        logging.warning(
+            "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
+            "ref: https://github.com/HazyResearch/flash-attention/issues/190#issuecomment-1523359593"
+        )
+    transformers.models.llama.modeling_llama.LlamaModel._prepare_decoder_attention_mask = (
+        _prepare_decoder_attention_mask
     )
-
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
-    trainer.save_model()
-    trainer.save_state()
-
-
-if __name__ == "__main__":
-    train()
+    transformers.models.llama.modeling_llama.LlamaAttention.forward = forward

@@ -1,6 +1,6 @@
 # PromptReformulate
 
-This is the official code for Capability-aware Prompt Reformulation Learning for Text-to-Image Generation.
+This is the official code for `Capability-aware Prompt Reformulation Learning for Text-to-Image Generation'.
 
 Capability-aware Prompt Reformulation (CAPR) innovatively integrates user capability into the reformulation process through two key components: the Conditional Reformulation Model (CRM) and Configurable Capability Features (CCF). CRM reformulates prompts according to a specified user capability, as represented by CCF. The CCF, in turn, offers the flexibility to tune and guide the CRM's behavior. This enables CAPR to effectively learn diverse reformulation strategies across various user capacities and to simulate high-capability user reformulation during inference. 
 

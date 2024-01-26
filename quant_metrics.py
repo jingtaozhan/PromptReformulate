@@ -3,31 +3,6 @@ import math
 import numpy as np
 from tqdm import tqdm
 
-# class QuantNum:
-#     def __init__(self, max_num):
-#         self.max_num = max_num
-#         self.centroids = []
-
-#     def train(self, data):
-#         from sklearn.cluster import KMeans
-#         # Reshape data for KMeans
-#         data = np.array(data).reshape(-1, 1)
-#         kmeans = KMeans(n_clusters=self.max_num, random_state=0, verbose=0, max_iter=1000).fit(data)
-#         self.centroids = sorted([centroid[0] for centroid in kmeans.cluster_centers_])
-
-#     def save(self, filename):
-#         with open(filename, 'w') as file:
-#             json.dump(self.centroids, file)
-
-#     def load(self, filename):
-#         with open(filename, 'r') as file:
-#             self.centroids = json.load(file)
-
-#     def evaluate(self, number):
-#         # Find the nearest centroid
-#         nearest = min(self.centroids, key=lambda x: abs(x - number))
-#         return self.centroids.index(nearest)
-
 class QuantNum:
     def __init__(self, max_num):
         self.max_num = max_num
