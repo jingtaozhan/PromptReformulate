@@ -3,8 +3,8 @@
 This code base is to provide algorithms to reformulate image prompts for better generation.
 
 We currently include code for the following two papers: 
-SIGIR 2024: Capability-aware Prompt Reformulation Learning for Text-to-Image Generation 
-ACL 2024: Prompt Refinement with Image Pivot for Text-to-Image Generation (We are currently working on the code base. Stay tuned!)
+- SIGIR 2024: Capability-aware Prompt Reformulation Learning for Text-to-Image Generation 
+- ACL 2024: Prompt Refinement with Image Pivot for Text-to-Image Generation (We are currently working on the code base. Stay tuned!)
 
 Capability-aware Prompt Reformulation (CAPR) innovatively integrates user capability into the reformulation process through two key components: the Conditional Reformulation Model (CRM) and Configurable Capability Features (CCF). CRM reformulates prompts according to a specified user capability, as represented by CCF. The CCF, in turn, offers the flexibility to tune and guide the CRM's behavior. This enables CAPR to effectively learn diverse reformulation strategies across various user capacities and to simulate high-capability user reformulation during inference. 
 
